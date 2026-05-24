@@ -1,0 +1,40 @@
+\documentclass[sigconf, nonacm]{acmart}
+
+\settopmatter{printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{tcolorbox}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{pifont}
+\newcommand{\modelname}{SemRaD\xspace}
+\newcommand{\xmark}{\ding{55}}
+\newcommand{\cmark}{\ding{51}}
+
+% Cross-references below (e.g. sec:teacher_hindsight) point to the main paper;
+% rendered as section numbers there. Provide stubs so they do not show as "??".
+\providecommand{\mainpaper}{the main paper}
+
+\title{Supplementary Material\\\large Bridging the Information Gap: Semantic Densification and Hindsight Distillation for Cold-Start Prediction}
+\author{Le et al.}
+\affiliation{\institution{}\country{}}
+\renewcommand{\shortauthors}{Le et al.}
+
+\begin{document}
+
+\maketitle
+
+\noindent This document provides supplementary material for the paper
+``Bridging the Information Gap: Semantic Densification and Hindsight
+Distillation for Cold-Start Prediction.'' Section references of the form
+``Section~X'' refer to the main paper.
+
+\renewcommand{\thesection}{S\arabic{section}}
+\setcounter{section}{0}
+
+\input{Components/appendix}
+
+\end{document}

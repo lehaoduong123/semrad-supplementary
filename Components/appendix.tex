@@ -1,0 +1,259 @@
+\section{Implementation and Training Details}
+\label{app:implementation}
+
+\subsection{Model Architecture}
+\label{app:model_architecture}
+
+We implement \modelname{} using PyTorch with the following configurations:
+\begin{itemize}
+    \item \textbf{Static Encoder:} A DNN based architecture containing a CrossNet (4 layers) and Deep Residual Blocks (2 blocks $\times$ 2 layers, hidden dim=1024) to capture feature interactions. The output dimension is $d_{stat}=128$.
+    \item \textbf{Dynamic Encoder:} A Transformer Encoder with 2 layers, 4 attention heads, and a feed-forward dimension of 256. We employ Attention Pooling to compress the sequence into $d_{dyn}=128$.
+    \item \textbf{Semantic-Gated Encoder:} We utilize Qwen-0.6B-Emb to generate initial 1024-dimensional embeddings for each of the $K$ reasoning fields. These are processed by field-specific MLPs (Linear-BN-GELU) and projected to $d_{aug}=512$.
+    \item \textbf{Multimodal Fusion:} The three views are concatenated ($128+128+512=768$) and fused via a projection MLP to a shared representation of size 128.
+    \item \textbf{Prediction Heads:} Two separate DeepTaskHeads (3-layer MLPs) are used for LTV (regression) and CVR (sigmoid classification).
+\end{itemize}
+
+\subsection{LLM Protocols}
+\label{app:llm_protocols}
+
+For semantic data generation, we utilize the open-source model \textbf{GPT-OSS 120B} as the inference engine for both student densification and teacher hindsight generation. For the text embedding layer in the Semantic-Gated Encoder, we use the pre-trained \textbf{Qwen-0.6B-Embedding} model frozen during training.
+
+\subsection{Training Configuration}
+\label{app:training_config}
+
+We train the model for 50 epochs with a batch size of 64 using the AdamW optimizer. The base learning rate is set to $10^{-3}$ accompanied by a 5-epoch linear warmup and cosine annealing decay. Weight decay is set to $5 \times 10^{-4}$ for regularization.
+
+\section{Prompt Engineering Details}
+\label{app:prompts}
+
+\subsection{Student Prompt (Densification)}
+The following system prompt is used to generate the Semantic Reasoning profile from the sparse $\mathbf{S}_{pre}$ history.
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=System Prompt: Student Profile Generation]
+\small
+\texttt{You are an expert user behavior analyst. Your goal is to infer latent user traits from sparse interaction logs.}
+
+\texttt{Input Context:} \\
+\texttt{- User Events: \{sequence\_logs\}} \\
+\texttt{- Static Profile: \{user\_profile\}}
+
+\texttt{Task: Analyze the user along the following dimensions:} \\
+\texttt{1. Temporal Resolution: Analyze the latency between discovery and action.} \\
+\texttt{2. Transaction Magnitude: Evaluate the relative value tier of interacted items.} \\
+\texttt{3. Navigation Intent Specificity: Determine the linearity of the user journey.} \\
+\texttt{4. Domain Entropy: Measure the distribution variance of interacted categories.}
+\\
+...
+
+\texttt{For each dimension, provide a specific \textbf{Reasoning Rationale} based on the evidence. Explain WHY you assigned the score.}
+\end{tcolorbox}
+
+\subsection{Teacher Prompt (Hindsight Fusion)}
+The following prompt is used to generate the ``Ground Truth'' reasoning by fusing the pre-conversion hypothesis with the post-conversion outcome (as described in the Hindsight-Aware Fusion section of the main paper).
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=System Prompt: Hindsight Reasoning Fusion]
+\small
+\texttt{You are an omniscient analyst with access to the user's future actions. Your goal is to resolve ambiguity in the user's initial behavior.}
+
+\texttt{Input Context:} \\
+\texttt{- Initial Behavior (Pre): \{pre\_summary\}} \\
+\texttt{- Future Outcome (Post): \{post\_summary\}}
+
+\texttt{Task: Re-evaluate the user's pre-conversion traits in light of the post-conversion outcomes.} \\
+\texttt{If the user hesitated in pre-conversion but converted in post-conversion, classify as "Cautious High-Intent."} \\
+\texttt{Explicitly explain how the future outcome clarifies the initial ambiguity.}
+\end{tcolorbox}
+
+\section{Feature Engineering and Preprocessing Details}
+\label{app:features}
+
+This section formalizes the mathematical treatment of static and dynamic features used in our framework, detailing the preprocessing transformations applied to ensure numerical stability and semantic preservation.
+
+\subsection{Static Features}
+\label{app:static_features}
+
+Static features $\mathbf{F}_{\text{static}} \in \mathbb{R}^{d_s}$ represent time-invariant or slowly-changing user attributes captured at the first-conversion timestamp $t_0$. We partition these features into categorical and numerical subsets based on their cardinality threshold $\tau = 50$.
+
+\paragraph{Categorical Static Features.}
+Let $\mathcal{C} = \{c_1, c_2, \ldots, c_m\}$ denote the set of categorical features where each $c_i$ has cardinality $|\mathcal{V}_{c_i}| < \tau$. The categorical feature set encompasses shop identifiers ($\text{shop\_id}$), brand identifiers ($\text{brand\_id}$), geographic area-of-region codes ($\text{aor\_id}$), shop taxonomies ($\text{shop\_type}$), and user marketing segments ($\text{user\_segment}$).
+
+For each categorical feature $c_i$, we construct a vocabulary $\mathcal{V}_{c_i} = \{v_0, v_1, \ldots, v_{|\mathcal{V}_{c_i}|}\}$ from the training corpus, where $v_0$ is reserved for out-of-vocabulary tokens. We map each feature value to an embedding vector via a learnable transformation $\mathbf{E}_{c_i}: \mathcal{V}_{c_i} \rightarrow \mathbb{R}^{d_e}$, where $d_e = 16$ by default. The unified categorical representation is obtained through concatenation:
+\begin{equation}
+\mathbf{F}_{\text{cat}} = [\mathbf{E}_{c_1}(v_1) \oplus \mathbf{E}_{c_2}(v_2) \oplus \cdots \oplus \mathbf{E}_{c_m}(v_m)] \in \mathbb{R}^{m \cdot d_e}
+\end{equation}
+where $\oplus$ denotes vector concatenation.
+
+\paragraph{Numerical Static Features.}
+Let $\mathcal{N} = \{n_1, n_2, \ldots, n_k\}$ denote numerical features with cardinality $|\mathcal{V}_{n_j}| \geq \tau$. These include user tenure duration ($\text{user\_tenure\_days}$), pre-conversion session counts ($\text{total\_sessions\_pre}$), pre-conversion event counts ($\text{total\_events\_pre}$), average session duration ($\text{avg\_session\_duration}$), and first-visit-to-conversion temporal span ($\text{first\_visit\_to\_conversion\_days}$).
+
+For each numerical feature $n_j \in \mathcal{N}$, we compute population statistics $\mu_{n_j}$ and $\sigma_{n_j}$ from the training distribution and apply $z$-score normalization:
+\begin{equation}
+n_j' = \frac{n_j - \mu_{n_j}}{\sigma_{n_j}}
+\end{equation}
+To ensure gradient stability during training, we apply clipping to bound extreme outliers:
+\begin{equation}
+n_j'' = \text{clip}(n_j', -5, 5) = \max(-5, \min(5, n_j'))
+\end{equation}
+The normalized numerical features are concatenated to form $\mathbf{F}_{\text{num}} = [n_1'', n_2'', \ldots, n_k''] \in \mathbb{R}^k$.
+
+\subsection{Dynamic Sequence Features}
+\label{app:dynamic_features}
+
+Dynamic features encode the temporal behavioral sequence $\mathbf{S}_{pre} = \{\mathbf{e}_1, \mathbf{e}_2, \ldots, \mathbf{e}_T\}$ (pre-conversion) and $\mathbf{S}_{post}$ (post-conversion, available only during training). Each event $\mathbf{e}_t$ at timestep $t$ is represented by a hybrid feature vector comprising categorical and numerical attributes.
+
+\paragraph{Categorical Sequence Features.}
+Each event $\mathbf{e}_t$ is characterized by a tuple of categorical features $(\text{type}_t, \text{shop\_type}_t, \text{shop\_aoi}_t)$ where:
+\begin{align}
+\text{type}_t &\in \mathcal{V}_{\text{type}} \\
+\text{shop\_type}_t &\in \mathcal{V}_{\text{shop}} \\
+\text{shop\_aoi}_t &\in \mathcal{V}_{\text{aoi}}
+\end{align}
+The event type vocabulary $\mathcal{V}_{\text{type}}$ encompasses action primitives such as \texttt{page\_view}, \texttt{item\_click}, \texttt{add\_to\_cart}, \texttt{search}, \texttt{filter\_apply}, \texttt{coupon\_collect}, and \texttt{purchase}. The shop type taxonomy $\mathcal{V}_{\text{shop}}$ includes coarse-grained categories (\texttt{fashion}, \texttt{electronics}, \texttt{home\_kitchen}, etc.), while $\mathcal{V}_{\text{aoi}}$ provides fine-grained shop location or brand cluster identifiers.
+
+Vocabularies are constructed from the union of all data splits to ensure complete coverage. Each categorical feature is mapped to a learned embedding space $\mathbb{R}^{d_{seq}}$ where $d_{seq} = 64$, with index 0 reserved for padding tokens. The categorical event representation is then:
+\begin{equation}
+\mathbf{e}_t^{\text{cat}} = [\mathbf{E}_{\text{type}}(\text{type}_t) \oplus \mathbf{E}_{\text{shop}}(\text{shop\_type}_t) \oplus \mathbf{E}_{\text{aoi}}(\text{shop\_aoi}_t)] \in \mathbb{R}^{3d_{seq}}
+\end{equation}
+
+\paragraph{Numerical Sequence Features.}
+Each event $\mathbf{e}_t$ additionally contains numerical features $\mathbf{x}_t = (\text{aov}_t, \text{price}_t, \Delta_t, T_t)$ capturing transaction magnitudes and temporal dynamics. Let $\text{aov}_t$ denote the shop's average order value (price tier proxy), $\text{price}_t$ the product unit price, $\Delta_t$ the inter-event time gap, and $T_t$ the cumulative elapsed time from sequence initiation.
+
+To handle the wide dynamic range of these features, we apply log-compression followed by standardization:
+\begin{equation}
+x_t' = \log(1 + x_t), \quad x_t'' = \frac{x_t' - \mu_x}{\sigma_x}
+\end{equation}
+where $\mu_x$ and $\sigma_x$ are computed from the training sequence distribution. Missing values are imputed with zero (the post-standardization mean). The normalized numerical event representation is $\mathbf{e}_t^{\text{num}} = [\text{aov}_t'', \text{price}_t'', \Delta_t'', T_t''] \in \mathbb{R}^4$.
+
+\subsection{Sequence Segmentation and Padding}
+\label{app:sequence_processing}
+
+\paragraph{Session Segmentation.}
+Raw event streams are partitioned into sessions using a temporal threshold $\tau_{\text{session}} = 300{,}000$ milliseconds (5 minutes). Formally, a session boundary is detected between consecutive events $\mathbf{e}_t$ and $\mathbf{e}_{t+1}$ when:
+\begin{equation}
+\Delta_{t+1} = \text{timestamp}(\mathbf{e}_{t+1}) - \text{timestamp}(\mathbf{e}_t) > \tau_{\text{session}}
+\end{equation}
+This segmentation preserves the hierarchical temporal structure of user behavior, enabling the model to distinguish between intra-session engagement patterns and inter-session deliberation periods.
+
+\paragraph{Sequence Length Management.}
+To accommodate variable-length sequences within fixed-size batches, we impose a maximum sequence length $L_{\max} = 5{,}600$. Let $\mathbf{S} = \{\mathbf{e}_1, \ldots, \mathbf{e}_T\}$ denote a raw sequence with length $T$. The processed sequence $\mathbf{S}'$ and attention mask $\mathbf{M} \in \{0,1\}^{L_{\max}}$ are constructed as:
+\begin{equation}
+\mathbf{S}' = \begin{cases}
+\{\mathbf{e}_{T-L_{\max}+1}, \ldots, \mathbf{e}_T\} & \text{if } T > L_{\max} \text{ (truncation)} \\
+\{\mathbf{e}_1, \ldots, \mathbf{e}_T, \mathbf{0}, \ldots, \mathbf{0}\} & \text{if } T \leq L_{\max} \text{ (padding)}
+\end{cases}
+\end{equation}
+\begin{equation}
+\mathbf{M}_i = \begin{cases}
+1 & \text{if } i \leq \min(T, L_{\max}) \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+The attention mask $\mathbf{M}$ is consumed by Transformer layers to prevent attention computation over padding positions, ensuring that $\text{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V})$ assigns zero weight to masked positions.
+
+\subsection{Data Splits and Alignment}
+\label{app:data_splits}
+
+\paragraph{Temporal Split Strategy.}
+To prevent temporal leakage and ensure realistic evaluation, we partition the dataset $\mathcal{D}$ using a strictly chronological split based on first-conversion timestamps. Let $\mathcal{D}_{\text{train}}$, $\mathcal{D}_{\text{val}}$, and $\mathcal{D}_{\text{test}}$ denote the training, validation, and test sets with cardinalities $|\mathcal{D}_{\text{train}}| = 100{,}000$, $|\mathcal{D}_{\text{val}}| = 10{,}000$, and $|\mathcal{D}_{\text{test}}| = 10{,}000$ respectively, yielding a total of $|\mathcal{D}| = 120{,}000$ stratified users. The temporal ordering ensures:
+\begin{equation}
+\max_{u \in \mathcal{D}_{\text{train}}} t_0^{(u)} < \min_{u \in \mathcal{D}_{\text{val}}} t_0^{(u)} < \min_{u \in \mathcal{D}_{\text{test}}} t_0^{(u)}
+\end{equation}
+where $t_0^{(u)}$ denotes the first-conversion timestamp for user $u$. This prevents the model from training on future information during validation or testing.
+
+\paragraph{Feature Alignment.}
+For each user $u$, we construct a unified feature tuple $(\mathbf{F}_{\text{static}}^{(u)}, \mathbf{S}_{\text{pre}}^{(u)}, \mathbf{S}_{\text{post}}^{(u)}, \mathbf{R}^{(u)})$ where $\mathbf{R}^{(u)}$ represents the augmented semantic reasoning features. All components are aligned via the user identifier key, with missing components imputed using zero vectors or padding sequences to ensure consistent batch construction across training and inference stages.
+
+\section{Schema Discovery Prompts and Example Reasoning Profiles}
+\label{app:examples}
+
+\subsection{Schema Discovery and Consolidation Prompts}
+\label{app:discovery_prompts}
+
+We provide the two prompts used in the \emph{discover--curate--audit} schema-construction workflow (described in the main paper). The \emph{Discover} prompt asks the LLM to propose candidate behavioral dimensions from a stratified batch of users; the \emph{Curate} prompt consolidates the deduplicated candidates into a small set of ranked finalists for expert review.
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=System Prompt: Dimension Discovery]
+\small
+\texttt{You are a behavioral analyst. Given a batch of \{n\} users (each with a sparse interaction log and an LTV/CVR outcome label), propose 3--6 \textbf{behavioral dimensions} that best discriminate high- from low-value users.}
+
+\texttt{Requirements per dimension:} \\
+\texttt{- Name (concise, interpretable).} \\
+\texttt{- Definition (what behavioral signal it captures).} \\
+\texttt{- Rationale (why it is predictive of LTV/CVR).}
+
+\texttt{Favor dimensions that are distinct from one another and computable from the available logs.}
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=System Prompt: Dimension Consolidation]
+\small
+\texttt{You are given \{m\} candidate behavioral dimensions (deduplicated across batches). Consolidate them into 6--8 \textbf{ranked finalists}.}
+
+\texttt{For each finalist: merge near-duplicates, give a canonical name and definition, and rank by expected predictive relevance and distinctness. Flag any candidate that is redundant or not computable from interaction logs.}
+\end{tcolorbox}
+
+\subsection{Example Generated Reasoning Profiles}
+\label{app:profile_examples}
+
+We provide illustrative examples of the generated semantic reasoning profiles for one representative validation user, along two dimensions (\textit{Temporal Resolution}, \textit{Transaction Magnitude}). We present the three reasoning profiles produced by our LLM pipeline: (1) \textbf{$\mathbf{Z}_{pre}$} -- student reasoning from pre-conversion logs only (available at serving time), (2) \textbf{$\mathbf{Z}_{post}$} -- reasoning from post-conversion logs (training-time privileged information), and (3) \textbf{$\mathbf{Z}_{fused}$} -- hindsight fusion that teaches the student what signals to trust in $\mathbf{Z}_{pre}$.
+
+\subsection{Example 1: Student Reasoning from Pre-Conversion ($\mathbf{Z}_{pre}$)}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 1: Temporal Resolution]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{pre}$):} The user generated 35 events over a 46‑minute window, yielding $<$1 event per minute – well below the $>$6 events/minute threshold for a short decision. The activity is spread across 21 sessions, many of which end with app\_quit, indicating a prolonged, fragmented decision process.
+
+\textbf{Label:} Low Resolution (Prolonged Deliberation)
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 2: Transaction Magnitude]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{pre}$):} The median price is below the regional average, and 71\% of the price bucket share falls in the lower range. Although the 90th percentile reaches higher values, the overall consumption pattern leans toward lower‑priced items, indicating low transaction magnitude.
+
+\textbf{Label:} Low Magnitude (Budget-Tier)
+\end{tcolorbox}
+
+\subsection{Example 2: Teacher Reasoning from Post-Conversion ($\mathbf{Z}_{post}$)}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 1: Temporal Resolution]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{post}$):} The user generated 110 events over a span of about 7.8 hours ($\approx$468 minutes) across 28 sessions, yielding roughly 0.23 events per minute and only $\sim$3.9 events per session. This low events‑per‑minute ratio and the large number of separate sessions indicate a prolonged decision‑making process rather than a quick, single‑session purchase.
+
+\textbf{Label:} Low Resolution (Prolonged Deliberation)
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 2: Transaction Magnitude]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{post}$):} The median price of items the user interacted with is well above the regional average, and the 90th‑percentile price is also substantially higher. Moreover, over 60\% of the price‑bucket share falls into the premium tier, showing a clear preference for higher‑priced products, which signals strong purchasing capacity.
+
+\textbf{Label:} High Magnitude (Premium-Tier)
+\end{tcolorbox}
+
+\subsection{Example 3: Hindsight-Aware Fusion ($\mathbf{Z}_{fused}$)}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 1: Temporal Resolution]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{fused}$):} The low event‑per‑minute rate observed in $\mathbf{S}_{pre}$ ($\approx$0.015) correctly foreshadowed the prolonged deliberation revealed in $\mathbf{S}_{post}$ ($\approx$0.05) and the large number of sessions. Both stages show sparse activity spread over many hours, so the temporal resolution is genuinely slow. \emph{Teaching signal:} The teacher should teach the student to focus on the density of events (events/min) and the count of distinct sessions as primary predictors of Temporal Resolution.
+
+\textbf{Label:} Low Resolution (Prolonged Deliberation)
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=gray!10, colframe=gray!50, title=Dimension 2: Transaction Magnitude]
+\small
+\textbf{Reasoning Rationale ($\mathbf{Z}_{fused}$):} The high price metrics in $\mathbf{S}_{pre}$ (median and 90th‑percentile well above regional average) were misleading noise caused by a tiny sample of expensive items from a single shop. In $\mathbf{S}_{post}$ the median price drops to well below regional average and the bulk of activity lies in lower price buckets, revealing low transaction magnitude. \emph{Teaching signal:} The teacher should teach the student to give weight to the overall price distribution across all sessions rather than isolated high‑price spikes, and to treat a concentrated high‑price exposure as a weak signal.
+
+\textbf{Label:} Low Magnitude (Budget-Tier)
+\end{tcolorbox}
+
+\section{Extended Related Work}
+\label{app:related_work}
+
+This section expands the discussion condensed in the main paper's Related Work.
+
+\subsection{Cold-Start Prediction}
+Classical collaborative-filtering and ID-based sequence models (DIN~\cite{zhou2018din}, DIEN~\cite{zhou2019dien}, SASRec~\cite{kang2018sasrec}) and feature-interaction models (DeepFM~\cite{guo2017deepfm}, DCN~\cite{wang2017dcn}) achieve strong warm-start accuracy but rely on dense interaction histories; under extreme sparsity their predictions regress toward population priors. Cold-start remedies fall into three families: (i) \emph{robustness} methods such as DropoutNet~\cite{volkovs2017dropoutnet} that randomly mask inputs to reduce over-reliance on dense features; (ii) \emph{meta-learning} approaches that learn fast adaptation from few interactions; and (iii) \emph{self-supervised} sequence objectives that pre-train representations. These mitigate the symptom of sparsity but do not inject external knowledge nor exploit privileged training-time outcomes---the two complementary levers \modelname{} targets.
+
+\subsection{LLMs for Recommendation and Reasoning}
+LLMs have been applied to recommendation through prompting and in-context formulations~\cite{geng2022p5,gao2023chatrec}, instruction tuning~\cite{bao2023tallrec}, and reasoning-centric pipelines that elicit natural-language rationales~\cite{yue2025cot4rec,tsai2024llmreason,kim2025exp3rt,wu2023llmrec}. A recurring limitation is that free-form generations are sensitive to prompt phrasing~\cite{sclar2024quantifying} and prone to hallucination~\cite{ji2023survey}, which complicates validation and monitoring in production. \modelname{} constrains generation to a curated behavioral schema, yielding structured, consistent rationales that are encoded by a frozen embedder at serving time so no LLM call is needed online.
+
+\subsection{Privileged Information, Distillation, and Mixtures of Experts}
+Learning using privileged information (LUPI)~\cite{vapnik2009lupi,lopezpaz2016unifying} formalizes training-time-only signals, and is commonly realized via knowledge distillation~\cite{hinton2015distill,romero2015fitnets}. In industrial recommendation, privileged-feature distillation (PFD~\cite{xu2020pfd}) and its hardness-aware extension (HAPFD~\cite{yuan2025hapfd}) feed post-conversion features to a teacher, but transfer through a single shared pathway. \modelname{} differs in two ways: (i) it reconciles pre- and post-conversion reasoning into a self-consistent hindsight target $\mathbf{Z}_{fused}$ rather than concatenating contradictory signals, and (ii) it routes transfer through per-user Distillation Experts~\cite{kang2020de}, a mixture-of-experts mechanism that allocates reconstruction capacity to heterogeneous transfer regimes.
+
